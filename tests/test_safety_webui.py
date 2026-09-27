@@ -67,11 +67,13 @@ class SafetyPanelWiringTests(unittest.TestCase):
             self.assertIn("fa-exclamation-triangle", tripped)
             self.assertIn("test halt", tripped)
 
-    def test_analysis_start_is_gated_by_llm_budget(self):
+    def test_remote_analysis_is_not_gated_by_local_llm_budget(self):
         with tempfile.TemporaryDirectory() as tmp:
             guard = _guard(tmp, daily_llm_token_budget=100)
             guard.record_llm_tokens(500)
-            with patch("tradingagents.safety.get_safety_guard", return_value=guard):
+            with patch("tradingagents.safety.get_safety_guard", return_value=guard), patch(
+                "webui.components.analysis.run_analysis"
+            ) as run_analysis, patch("webui.components.analysis.create_chart"):
                 from webui.components.analysis import start_analysis
 
                 message = start_analysis(
@@ -86,8 +88,9 @@ class SafetyPanelWiringTests(unittest.TestCase):
                     quick_llm="gpt-test",
                     deep_llm="gpt-test",
                 )
+            run_analysis.assert_called_once()
             self.assertIsInstance(message, str)
-            self.assertIn("budget", message.lower())
+            self.assertIn("TradingAgents API", message)
 
 
 if __name__ == "__main__":

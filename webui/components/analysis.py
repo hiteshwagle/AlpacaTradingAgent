@@ -2,16 +2,91 @@
 webui/components/analysis.py
 """
 
-import time
-from tradingagents.graph.trading_graph import TradingAgentsGraph
-from tradingagents.graph.checkpointer import clear_checkpoint
+from datetime import datetime
+
+from integrations.tradingagents_api import (
+    TradingAgentsAPIClient,
+    TradingAgentsAPIError,
+    build_trade_intent,
+    map_analysts,
+    reconcile_action,
+    result_to_webui_state,
+)
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.run_logger import get_run_audit_logger
-from tradingagents.dataflows.alpaca_utils import AlpacaUtils
+from tradingagents.dataflows.alpaca_utils import AlpacaUtils, get_alpaca_trading_client
 from tradingagents.agents.schemas import trade_intent_action
-from tradingagents.agents.utils.agent_trading_modes import extract_recommendation
 from webui.utils.state import app_state
 from webui.utils.charts import create_chart
+
+
+def _portfolio_context_from_alpaca():
+    """Return a point-in-time broker portfolio, or None if it cannot be verified."""
+    try:
+        client = get_alpaca_trading_client()
+        account = client.get_account()
+        positions = client.get_all_positions()
+        return {
+            "cash": float(account.cash),
+            "currency": "USD",
+            "positions": [
+                {
+                    "ticker": position.symbol,
+                    "quantity": float(position.qty),
+                    "average_price": float(position.avg_entry_price),
+                }
+                for position in positions
+            ],
+        }
+    except Exception as exc:
+        print(f"[ANALYSIS] Alpaca portfolio context unavailable: {exc}")
+        return None
+
+
+def _api_payload(ticker, selected_analysts, depth_rounds, output_language, checkpoint_enabled):
+    symbol = ticker.strip().upper()
+    return {
+        "symbol": symbol,
+        "trade_date": datetime.now().strftime("%Y-%m-%d"),
+        "asset_type": "crypto" if "/" in symbol else "stock",
+        "analysts": map_analysts(selected_analysts),
+        "portfolio": _portfolio_context_from_alpaca(),
+        "options": {
+            "max_debate_rounds": depth_rounds,
+            "max_risk_rounds": depth_rounds,
+            "output_language": output_language or "English",
+            "checkpoint_enabled": bool(checkpoint_enabled),
+            "save_reports": True,
+        },
+    }
+
+
+def _apply_api_result(current_state, result, selected_analysts):
+    final_state = result_to_webui_state(result, selected_analysts)
+    reports = current_state["current_reports"]
+    reports.update(
+        {
+            "market_report": final_state["market_report"],
+            "sentiment_report": final_state["sentiment_report"],
+            "news_report": final_state["news_report"],
+            "fundamentals_report": final_state["fundamentals_report"],
+            "macro_report": final_state["macro_report"],
+            "bull_report": final_state["investment_debate_state"]["bull_history"],
+            "bear_report": final_state["investment_debate_state"]["bear_history"],
+            "research_manager_report": final_state["investment_plan"],
+            "investment_plan": final_state["investment_plan"],
+            "trader_investment_plan": final_state["trader_investment_plan"],
+            "risky_report": final_state["risk_debate_state"]["risky_history"],
+            "safe_report": final_state["risk_debate_state"]["safe_history"],
+            "neutral_report": final_state["risk_debate_state"]["neutral_history"],
+            "portfolio_decision": final_state["risk_debate_state"]["judge_decision"],
+            "final_trade_decision": final_state["final_trade_decision"],
+        }
+    )
+    current_state["investment_debate_state"] = final_state["investment_debate_state"]
+    current_state["risk_debate_state"] = final_state["risk_debate_state"]
+    current_state["source_urls"] = list(result.get("source_urls") or [])
+    return final_state
 
 
 def execute_trade_after_analysis(ticker, allow_shorts, trade_amount):
@@ -32,37 +107,17 @@ def execute_trade_after_analysis(ticker, allow_shorts, trade_amount):
 
         print(f"[TRADE] Analysis complete for {ticker}, checking for recommended action")
 
-        # Prefer the typed execution intent produced by the risk manager.
-        trade_intent = state.get("final_trade_intent")
         analysis_results = state.get("analysis_results") or {}
-        if not trade_intent:
-            trade_intent = analysis_results.get("trade_intent")
-        if not trade_intent and analysis_results.get("full_state"):
-            trade_intent = analysis_results["full_state"].get("final_trade_intent")
-
-        intent_action = trade_intent_action(trade_intent)
-        if intent_action:
-            print(f"[TRADE] Typed trade intent action: {intent_action}")
-
-        # Get the recommended action
-        recommended_action = state.get("recommended_action")
+        api_result = analysis_results.get("api_result")
+        trade_intent = None
+        recommended_action = reconcile_action(api_result) if api_result else state.get("recommended_action")
         print(f"[TRADE] Direct recommended_action: {recommended_action}")
-        if not recommended_action and intent_action:
-            recommended_action = intent_action
 
         if not recommended_action:
-            # Try to extract from final trade decision
-            final_decision = state["current_reports"].get("final_trade_decision")
-            print(f"[TRADE] Final decision available: {bool(final_decision)}")
-            if final_decision:
-                trading_mode = "trading" if allow_shorts else "investment"
-                print(f"[TRADE] Extracting recommendation using mode: {trading_mode}")
-                recommended_action = extract_recommendation(final_decision, trading_mode)
-                print(f"[TRADE] Extracted recommendation: {recommended_action}")
-
-        if not recommended_action:
-            print(f"[TRADE] No recommended action found for {ticker}, skipping trade execution")
-            print(f"[TRADE] Available reports: {list(state['current_reports'].keys())}")
+            print(
+                f"[TRADE] TradingAgents rating/action is absent or inconsistent for {ticker}; "
+                "skipping trade execution"
+            )
             return
 
         print(f"[TRADE] Executing trade for {ticker}: {recommended_action} with ${trade_amount}")
@@ -134,8 +189,30 @@ def execute_trade_after_analysis(ticker, allow_shorts, trade_amount):
             return
         print(f"[TRADE] Current position for {ticker}: {current_position}")
 
-        # Execute the typed intent when present; fall back to legacy signal execution
-        # for older runs or providers that could not produce structured output.
+        if api_result:
+            try:
+                trade_intent = build_trade_intent(
+                    api_result,
+                    symbol=ticker,
+                    current_position=current_position,
+                    allow_shorts=allow_shorts,
+                    trade_date=str(analysis_results.get("date") or ""),
+                )
+            except TradingAgentsAPIError as exc:
+                print(f"[TRADE] {exc}")
+                state["trading_results"] = {"error": str(exc)}
+                return
+            state["final_trade_intent"] = trade_intent
+            analysis_results["trade_intent"] = trade_intent
+            intent_action = trade_intent_action(trade_intent)
+            if intent_action != recommended_action:
+                state["trading_results"] = {
+                    "error": "Trade intent action did not match the accepted TradingAgents action; trade blocked."
+                }
+                return
+
+        # API-backed runs always execute a freshly built typed intent. The legacy
+        # branch remains only for stored pre-integration runs.
         if trade_intent:
             risk_params = (
                 dict(DEFAULT_CONFIG.get("risk_sizing_params") or {})
@@ -228,190 +305,115 @@ def run_analysis(
     provider_settings=None,
     progress=None,
 ):
-    """Run the trading analysis using current/real-time data
-
-    Args:
-        research_depth_config: Either a dict with "rounds" and "level" keys,
-                              or an integer for backward compatibility
-    """
+    """Request research from TradingAgents and prepare it for Alpaca controls."""
     run_logger = get_run_audit_logger()
     run_started = False
     final_state = None
-    current_date = None
+    current_state = app_state.get_state(ticker)
+    current_date = datetime.now().strftime("%Y-%m-%d")
 
     try:
-        # Always use current date for real-time analysis
-        from datetime import datetime
-        current_date = datetime.now().strftime("%Y-%m-%d")
-
-        print(f"Starting real-time analysis for {ticker} with current date: {current_date}")
-        current_state = app_state.get_state(ticker)
         if not current_state:
-            print(f"Error: No state found for {ticker}")
-            return
+            raise TradingAgentsAPIError(f"No UI state exists for {ticker}.")
+        print(f"Requesting TradingAgents analysis for {ticker} on {current_date}")
         current_state["analysis_running"] = True
         current_state["analysis_complete"] = False
+        current_state["analysis_error"] = None
 
-        # Handle both new dict format and legacy integer format
         if isinstance(research_depth_config, dict):
             depth_rounds = research_depth_config.get("rounds", 3)
             depth_level = research_depth_config.get("level", "Medium")
         else:
-            # Legacy integer format - convert back to string
             depth_rounds = research_depth_config
             depth_map = {1: "Shallow", 3: "Medium", 5: "Deep"}
             depth_level = depth_map.get(research_depth_config, "Medium")
 
-        # Create config with selected options
-        config = DEFAULT_CONFIG.copy()
-        config["max_debate_rounds"] = depth_rounds
-        config["max_risk_discuss_rounds"] = depth_rounds
-        config["research_depth"] = depth_level  # String for LLM parameter mapping
-        config["allow_shorts"] = allow_shorts
-        config["trading_mode"] = "trading" if allow_shorts else "investment"
-        config["parallel_analysts"] = True  # Run analysts in parallel for faster execution
-        config["quick_think_llm"] = quick_llm
-        config["deep_think_llm"] = deep_llm
-        config["quick_llm_params"] = quick_llm_params or {}
-        config["deep_llm_params"] = deep_llm_params or {}
-        config["llm_provider"] = llm_provider or "openai"
-        config["backend_url"] = backend_url or None
-        config["output_language"] = output_language or "English"
-        config["checkpoint_enabled"] = bool(checkpoint_enabled)
-        for key, value in (provider_settings or {}).items():
-            if value not in (None, ""):
-                config[key] = value
-
-        # Initialize TradingAgentsGraph
-        print(f"Initializing TradingAgentsGraph with analysts: {selected_analysts}")
-        graph = TradingAgentsGraph(selected_analysts, config=config, debug=True)
-        graph._resolve_memory_log_outcomes(ticker, current_date)
-        init_agent_state = graph.propagator.create_initial_state(ticker, current_date)
+        payload = _api_payload(
+            ticker,
+            selected_analysts,
+            depth_rounds,
+            output_language,
+            checkpoint_enabled,
+        )
+        client = TradingAgentsAPIClient()
+        audit_config = {
+            "research_provider": "tradingagents_api",
+            "tradingagents_api_url": client.base_url,
+            "selected_analysts": payload["analysts"],
+            "research_depth": depth_level,
+            "max_debate_rounds": depth_rounds,
+            "max_risk_discuss_rounds": depth_rounds,
+            "output_language": output_language or "English",
+            "allow_shorts": allow_shorts,
+        }
         run_logger.start_run(
             symbol=ticker,
             trade_date=current_date,
-            config=config,
-            metadata={"debug": True, "source": "webui_stream"},
+            config=audit_config,
+            metadata={"source": "tradingagents_api"},
         )
         run_started = True
-        run_logger.log_state_snapshot(
-            stage="initial_state",
-            snapshot=init_agent_state,
-            symbol=ticker,
-        )
 
-        # Status updates are now handled in the parallel execution coordinator
+        active_agents = {
+            "market": "Market Analyst",
+            "social": "Social Analyst",
+            "news": "News Analyst",
+            "fundamentals": "Fundamentals Analyst",
+        }
+        if "macro" in selected_analysts:
+            active_agents["macro"] = "Macro Analyst"
+        for key, label in active_agents.items():
+            if key in selected_analysts or (key == "news" and "news" in payload["analysts"]):
+                app_state.update_agent_status(label, "in_progress")
 
-        # Force an initial UI update
-        app_state.needs_ui_update = True
+        def on_status(job):
+            status = str(job.get("status", ""))
+            print(f"[ANALYSIS] TradingAgents job {job.get('analysis_id')}: {status}")
+            if progress is not None:
+                progress(0.05 if status == "queued" else 0.25)
+            app_state.needs_ui_update = True
 
-        # Run analysis with tracing using current date
-        print(f"Starting graph stream for {ticker} with current market data")
-        trace = []
-        graph_args = graph._graph_args_for_run(ticker, current_date)
-        graph_args["config"]["recursion_limit"] = 100
-        compiled_graph, checkpointer_ctx = graph._graph_for_run(ticker, current_date)
-        try:
-            for chunk in compiled_graph.stream(init_agent_state, **graph_args):
-                # Track progress
-                trace.append(chunk)
+        result = client.analyze(payload, on_status=on_status)
+        final_state = _apply_api_result(current_state, result, selected_analysts)
+        decision = reconcile_action(result)
+        if decision is None:
+            print("[ANALYSIS] Remote result is advisory only: rating and action did not reconcile.")
 
-                # Process intermediate results
-                app_state.process_chunk_updates(chunk)
+        current_state["recommended_action"] = decision
+        current_state["final_trade_intent"] = None
+        current_state["analysis_results"] = {
+            "ticker": ticker,
+            "date": current_date,
+            "decision": decision,
+            "trade_intent": None,
+            "api_result": result,
+            "analysis_id": result["_api_metadata"]["analysis_id"],
+            "source_urls": list(result.get("source_urls") or []),
+            "full_state": final_state,
+        }
 
-                app_state.needs_ui_update = True
+        for agent in current_state["agent_statuses"]:
+            app_state.update_agent_status(agent, "completed")
 
-                # Update progress bar if provided
-                if progress is not None:
-                    # Simulate progress based on steps completed
-                    completed_agents = sum(1 for status in current_state["agent_statuses"].values() if status == "completed")
-                    total_agents = len(current_state["agent_statuses"])
-                    if total_agents > 0:
-                        progress(completed_agents / total_agents)
-
-                # Small delay to prevent UI lag
-                time.sleep(0.1)
-        finally:
-            if checkpointer_ctx is not None:
-                checkpointer_ctx.__exit__(None, None, None)
-
-        # Extract final results
-        final_state = trace[-1]
-        trade_intent = final_state.get("final_trade_intent")
-        decision = trade_intent_action(trade_intent) or graph.process_signal(final_state["final_trade_decision"])
-        graph.curr_state = final_state
-        graph.ticker = ticker
-        graph._log_state(current_date, final_state)
-
-        filtered_tool_calls = [
-            call for call in app_state.tool_calls_log
-            if call.get("symbol") == ticker
-        ]
-        run_logger.log_state_snapshot(
-            stage="webui_runtime_context",
-            snapshot={
-                "session_id": current_state.get("session_id"),
-                "session_start_time": current_state.get("session_start_time"),
-                "agent_prompts": current_state.get("agent_prompts", {}),
-                "tool_calls": filtered_tool_calls,
-                "llm_calls_count": app_state.llm_calls_count,
-                "tool_calls_count": app_state.tool_calls_count,
-            },
-            symbol=ticker,
-        )
         run_logger.finish_run(
             symbol=ticker,
             status="completed",
             final_state=final_state,
             final_signal=decision,
         )
-        graph.memory_log.store_decision(
-            ticker=ticker,
-            trade_date=current_date,
-            final_trade_decision=final_state["final_trade_decision"],
-            trading_mode=final_state.get("trading_mode", config.get("trading_mode", "investment")),
-        )
-        if config.get("checkpoint_enabled", False):
-            clear_checkpoint(config["data_cache_dir"], ticker, current_date)
         run_started = False
-
-        # NEW: Persist the extracted decision so the trading engine can act on it directly
-        current_state["recommended_action"] = decision
-        current_state["final_trade_intent"] = trade_intent
-
-        # Mark all agents as completed
-        for agent in current_state["agent_statuses"]:
-            app_state.update_agent_status(agent, "completed")
-
-        # Set final results
-        current_state["analysis_results"] = {
-            "ticker": ticker,
-            "date": current_date,
-            "decision": decision,
-            "trade_intent": trade_intent,
-            "full_state": final_state,
-        }
-
-        # Use real chart data with current date (no end_date means most recent data)
         current_state["chart_data"] = create_chart(ticker, period="1y", end_date=None)
-
         current_state["analysis_complete"] = True
+        if progress is not None:
+            progress(1.0)
 
-        # Execute trade if enabled
         trade_enabled = getattr(app_state, 'trade_enabled', False)
         trade_amount = getattr(app_state, 'trade_amount', 1000)
-        print(f"[TRADE] Checking trading settings for {ticker}:")
-        print(f"[TRADE]   - trade_enabled: {trade_enabled}")
-        print(f"[TRADE]   - trade_amount: {trade_amount}")
-        print(f"[TRADE]   - allow_shorts: {allow_shorts}")
-
         if trade_enabled:
             print(f"[TRADE] Trading enabled for {ticker}, executing trade with ${trade_amount}")
             execute_trade_after_analysis(ticker, allow_shorts, trade_amount)
         else:
             print(f"[TRADE] Trading disabled for {ticker}, skipping trade execution")
-
-        # Final UI update to show completion
         app_state.needs_ui_update = True
 
     except Exception as e:
@@ -426,12 +428,16 @@ def run_analysis(
                 error_message=str(e),
             )
             run_started = False
+        if current_state:
+            current_state["analysis_complete"] = False
+            current_state["analysis_error"] = str(e)
+            current_state["analysis_results"] = {"error": str(e)}
         if progress is not None:
-            progress(1.0)  # Complete the progress bar
+            progress(1.0)
     finally:
-        # Mark analysis as no longer running
         print(f"Real-time analysis for {ticker} completed")
-        current_state["analysis_running"] = False
+        if current_state:
+            current_state["analysis_running"] = False
 
     return "Real-time analysis complete"
 
@@ -457,19 +463,6 @@ def start_analysis(
     progress=None,
 ):
     """Start real-time analysis function for the UI"""
-
-    # Deterministic LLM budget gate (production safety layer): refuse to burn
-    # tokens on a new analysis once the daily budget is exhausted.
-    try:
-        from tradingagents.safety import get_safety_guard
-
-        budget_verdict = get_safety_guard().check_llm_budget()
-    except Exception:
-        budget_verdict = None
-    if budget_verdict is not None and not budget_verdict.allowed:
-        message = " ".join(budget_verdict.reasons)
-        print(f"[SAFETY] {message}")
-        return message
 
     # Parse selected analysts
     selected_analysts = []
@@ -531,4 +524,4 @@ def start_analysis(
     # Update the status message with more details
     trading_mode = "Trading Mode (LONG/NEUTRAL/SHORT)" if allow_shorts else "Investment Mode (BUY/HOLD/SELL)"
     trade_text = f" with ${getattr(app_state, 'trade_amount', 1000)} optional order execution" if getattr(app_state, 'trade_enabled', False) else ""
-    return f"Real-time analysis started for {ticker} with {len(selected_analysts)} analysts in {trading_mode}{trade_text} using parallel execution and current market data. Status table will update automatically."
+    return f"TradingAgents API analysis started for {ticker} with {len(selected_analysts)} analyst selections in {trading_mode}{trade_text}. Alpaca independently validates any order before execution."

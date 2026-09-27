@@ -196,11 +196,47 @@ The CLI now supports multiple symbols and crypto assets:
 
 ### Web UI Usage
 
-Launch the enhanced Dash-based web interface:
+The WebUI delegates research to the local TradingAgents HTTP API. Start
+TradingAgents first from its repository:
+
+```bash
+python -m tradingagents.api
+```
+
+Set the same `TRADINGAGENTS_API_KEY` in both projects, then launch the enhanced
+Dash-based Alpaca interface:
 
 ```bash
 python run_webui_dash.py
 ```
+
+The relevant Alpaca environment settings are:
+
+```bash
+TRADINGAGENTS_API_URL=http://127.0.0.1:8000
+TRADINGAGENTS_API_KEY=
+TRADINGAGENTS_API_REQUEST_TIMEOUT_SECONDS=30
+TRADINGAGENTS_API_TIMEOUT_SECONDS=900
+TRADINGAGENTS_API_POLL_SECONDS=2
+TRADINGAGENTS_API_MAX_ANALYSIS_AGE_SECONDS=1800
+```
+
+TradingAgents supplies the reports, debates, sources, advisory rating, and
+trader action. AlpacaTradingAgent makes the execution decision deterministically:
+it requires the rating and action to agree, checks result freshness, reads the
+live Alpaca position, rebuilds a typed trade intent, applies portfolio/regime
+sizing and broker safety controls, and may hold, resize, or veto the order. It
+does not run a second LLM and it does not silently fall back to the embedded
+local analysis graph if the API fails. TradingAgents recommendations are
+long/flat (`BUY/HOLD/SELL`); enabling shorts does not turn a `SELL` into a new
+short position.
+
+Selecting Macro in this WebUI requests TradingAgents' dedicated Macro Analyst,
+which evaluates FRED indicators, global macro news, and forward-looking event
+probabilities for both stocks and crypto. The WebUI's model/provider controls
+do not override server-side TradingAgents credentials or model configuration.
+The legacy CLI still uses the embedded analysis implementation; the API-backed
+separation currently applies to the WebUI execution path.
 
 Common options:
 - `--port PORT`: Specify a custom port (default: 7860)
