@@ -1,11 +1,35 @@
 """Persistent walk-forward historical validation for the simple dashboard."""
 from __future__ import annotations
 
+import os
 from statistics import mean
 
 from .models import HistoricalValidationRequest
 
 NEUTRAL_RETURN_BAND = .01
+_VALIDATION_ROUND_ENV = {
+    "max_debate_rounds": "TRADINGAGENTS_VALIDATION_MAX_DEBATE_ROUNDS",
+    "max_risk_rounds": "TRADINGAGENTS_VALIDATION_MAX_RISK_ROUNDS",
+}
+
+
+class ValidationStopped(Exception):
+    """Internal control flow for a user-requested cooperative stop."""
+
+
+def validation_round_options():
+    """Return bounded per-request round limits for historical validation."""
+    options = {}
+    for option, variable in _VALIDATION_ROUND_ENV.items():
+        raw = os.getenv(variable, "1").strip()
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError(f"{variable} must be an integer from 1 to 10") from exc
+        if not 1 <= value <= 10:
+            raise ValueError(f"{variable} must be between 1 and 10")
+        options[option] = value
+    return options
 
 
 def outcome_verdict(action, asset_return):
@@ -122,7 +146,10 @@ class HistoricalValidator:
                                "percent": 1, "completed": 0, "total": total}
         self.store.update_validation(run_id, "running", payload)
         try:
+            round_options = validation_round_options()
             for analysis_date in request.analysis_dates:
+                if self.store.validation_stop_requested(run_id):
+                    raise ValidationStopped
                 date_text = analysis_date.isoformat()
                 if date_text not in benchmark_cache:
                     try:
@@ -134,6 +161,8 @@ class HistoricalValidator:
                         # remain useful when SPY history is temporarily unavailable.
                         benchmark_cache[date_text] = []
                 for ticker in request.symbols:
+                    if self.store.validation_stop_requested(run_id):
+                        raise ValidationStopped
                     payload["progress"] = {
                         "step": "analyzing", "message": f"Analyzing {ticker} as of {date_text}",
                         "symbol": ticker, "analysis_date": date_text, "completed": completed,
@@ -146,15 +175,22 @@ class HistoricalValidator:
                             "symbol": ticker, "trade_date": date_text, "asset_type": "stock",
                             "analysts": ["market", "social", "news", "fundamentals", "macro"],
                             "options": {"output_language": "English", "save_reports": False,
-                                        "x_posts_mode": request.x_posts_mode},
-                        }, lambda job_id: result_row.update(analysis_id=job_id))
+                                        "x_posts_mode": request.x_posts_mode, **round_options},
+                        }, lambda job_id: result_row.update(analysis_id=job_id),
+                            lambda: self.store.validation_stop_requested(run_id))
+                        if self.store.validation_stop_requested(run_id):
+                            raise ValidationStopped
                         action = result.get("recommendation", {}).get("action")
                         bars = self.broker.daily_bars(ticker, date_text, max(request.horizons) + 2)
                         result_row.update(
                             status="completed", recommendation=result.get("recommendation", {}),
                             score=score_decision(action, bars, benchmark_cache[date_text], request.horizons),
                         )
+                    except ValidationStopped:
+                        raise
                     except Exception as exc:
+                        if self.store.validation_stop_requested(run_id):
+                            raise ValidationStopped from None
                         # Persist a safe error class only; remote bodies and credentials never enter the UI.
                         result_row.update(status="failed", error=type(exc).__name__)
                     payload["results"].append(result_row)
@@ -169,6 +205,15 @@ class HistoricalValidator:
             payload["progress"] = {"step": "completed", "message": "Historical validation complete",
                                    "completed": total, "total": total, "percent": 100}
             self.store.update_validation(run_id, "completed", payload)
+        except ValidationStopped:
+            payload["stop_requested"] = True
+            payload["summary"] = summarize(payload["results"])
+            payload["progress"] = {
+                "step": "stopped", "message": "Validation stopped; completed results were kept",
+                "completed": completed, "total": total,
+                "percent": round(completed / total * 95),
+            }
+            self.store.update_validation(run_id, "stopped", payload)
         except Exception as exc:
             payload["error"] = type(exc).__name__
             payload["progress"] = {"step": "failed", "message": "Historical validation stopped",

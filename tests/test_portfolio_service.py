@@ -26,6 +26,7 @@ from portfolio_service.validation import (
     outcome_verdict,
     score_decision,
     summarize,
+    validation_round_options,
 )
 from portfolio_service.web import register
 from portfolio_service.worker import tick
@@ -219,8 +220,54 @@ class StoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already running"):
             self.store.enqueue_validation(request)
 
+    def test_queued_validation_can_be_stopped_without_losing_its_record(self):
+        request = HistoricalValidationRequest(
+            symbols=["AAPL"], knowledge_cutoff="2025-08-31",
+            analysis_dates=["2025-09-04"], horizons=[5],
+        )
+        run_id = self.store.enqueue_validation(request)
+
+        status = self.store.request_validation_stop(run_id)
+        row = self.store.validation(run_id)
+
+        self.assertEqual(status, "stopped")
+        self.assertEqual(row["status"], "stopped")
+        self.assertTrue(row["payload"]["stop_requested"])
+        self.assertEqual(row["payload"]["progress"]["step"], "stopped")
+
+    def test_stale_worker_progress_cannot_erase_a_stop_request(self):
+        request = HistoricalValidationRequest(
+            symbols=["AAPL"], knowledge_cutoff="2025-08-31",
+            analysis_dates=["2025-09-04"], horizons=[5],
+        )
+        run_id = self.store.enqueue_validation(request)
+        stale = self.store.validation(run_id)["payload"]
+        self.store.update_validation(run_id, "running", stale)
+        self.store.request_validation_stop(run_id)
+
+        stale["progress"]["message"] = "Worker progress written after the click"
+        self.store.update_validation(run_id, "running", stale)
+
+        self.assertTrue(self.store.validation_stop_requested(run_id))
+
 
 class HistoricalValidationTests(unittest.TestCase):
+    def test_validation_round_options_default_to_one_and_are_bounded(self):
+        names = {
+            "TRADINGAGENTS_VALIDATION_MAX_DEBATE_ROUNDS": "1",
+            "TRADINGAGENTS_VALIDATION_MAX_RISK_ROUNDS": "1",
+        }
+        with patch.dict(os.environ, names, clear=False):
+            self.assertEqual(validation_round_options(), {
+                "max_debate_rounds": 1, "max_risk_rounds": 1,
+            })
+        with patch.dict(os.environ, {
+            "TRADINGAGENTS_VALIDATION_MAX_DEBATE_ROUNDS": "0",
+            "TRADINGAGENTS_VALIDATION_MAX_RISK_ROUNDS": "1",
+        }, clear=False):
+            with self.assertRaisesRegex(ValueError, "between 1 and 10"):
+                validation_round_options()
+
     def test_portfolio_outcome_matrix(self):
         cases = [
             ("Buy", .02, "matched"),
@@ -322,6 +369,37 @@ class HistoricalValidationTests(unittest.TestCase):
             self.assertEqual(row["payload"]["summary"]["decisions_completed"], 1)
             self.assertEqual(row["payload"]["summary"]["decisions_failed"], 1)
             self.assertEqual(research.payload["options"]["x_posts_mode"], "disabled")
+            self.assertEqual(research.payload["options"]["max_debate_rounds"], 1)
+            self.assertEqual(research.payload["options"]["max_risk_rounds"], 1)
+
+    def test_running_validation_cancels_research_and_keeps_completed_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(os.path.join(directory, "validation.db"))
+            request = HistoricalValidationRequest(
+                symbols=["AAPL"], knowledge_cutoff="2025-08-31",
+                analysis_dates=["2025-09-04"], horizons=[5],
+            )
+            run_id = store.enqueue_validation(request)
+
+            class Research:
+                def analyze(self, payload, on_job, stopped):
+                    on_job("job-aapl")
+                    store.request_validation_stop(run_id)
+                    if stopped():
+                        raise RemoteError("cancelled")
+
+            class Broker:
+                def daily_bars(self, ticker, start_date, sessions):
+                    return [{"date": "2025-09-05", "open": 100},
+                            {"date": "2025-09-12", "open": 101}]
+
+            HistoricalValidator(store, Broker(), Research()).run(run_id)
+            row = store.validation(run_id)
+
+            self.assertEqual(row["status"], "stopped")
+            self.assertEqual(row["payload"]["results"], [])
+            self.assertEqual(row["payload"]["progress"]["step"], "stopped")
+            self.assertIn("completed results were kept", row["payload"]["progress"]["message"])
 
 
 class EngineTests(unittest.TestCase):
@@ -635,6 +713,24 @@ class WebTests(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
         latest = self.client.get("/api/portfolio/validations/latest", headers=self.auth).get_json()
         self.assertEqual(latest["validation"]["payload"]["progress"]["total"], 2)
+
+    def test_historical_validation_endpoint_stops_a_queued_run(self):
+        headers = {**self.auth, "X-Portfolio-Request": "1"}
+        queued = self.client.post("/api/portfolio/validations", headers=headers, json={
+            "symbols": ["AAPL"], "knowledge_cutoff": "2025-08-31",
+            "analysis_dates": ["2025-09-04"], "horizons": [5],
+            "x_posts_mode": "disabled",
+        }).get_json()
+
+        response = self.client.post(
+            f"/api/portfolio/validations/{queued['validation_id']}/stop",
+            headers=headers, json={},
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.get_json()["status"], "stopped")
+        latest = self.client.get("/api/portfolio/validations/latest", headers=self.auth).get_json()
+        self.assertEqual(latest["validation"]["status"], "stopped")
 
     def test_historical_validation_rejects_future_or_oversized_grid(self):
         headers = {**self.auth, "X-Portfolio-Request": "1"}

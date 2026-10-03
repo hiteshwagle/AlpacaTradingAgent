@@ -84,6 +84,17 @@ match rate. Hold is shown as Keep and represents retaining an existing long
 position: it matches when the return is at least -1% and fails only on a larger
 loss. Keep returns contribute the position's realized return rather than zero.
 
+Historical validation sends per-request round limits to TradingAgents. It
+defaults to one research-debate round and one risk-debate round through
+`TRADINGAGENTS_VALIDATION_MAX_DEBATE_ROUNDS=1` and
+`TRADINGAGENTS_VALIDATION_MAX_RISK_ROUNDS=1`. These values do not change normal
+paper analysis, which continues to use its configured 2/2 rounds.
+
+Use **Stop validation** to cancel a queued or running validation cooperatively.
+If a TradingAgents analysis is active, its API job is cancelled at the next
+poll; completed validation rows remain available, and the run becomes
+`stopped`. The worker and dashboard containers remain running.
+
 When running without Docker, start the validation worker in a second terminal:
 
 ```bash

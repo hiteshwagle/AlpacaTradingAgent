@@ -31,11 +31,17 @@ def main():
         for row in store.validations(20):
             if row["status"] == "running":
                 payload = row["payload"]
-                payload["error"] = "worker_restarted"
-                payload["progress"].update(
-                    step="failed", message="Validation was interrupted by a worker restart"
-                )
-                store.update_validation(row["id"], "failed", payload)
+                if payload.get("stop_requested"):
+                    payload["progress"].update(
+                        step="stopped", message="Validation stopped; completed results were kept"
+                    )
+                    store.update_validation(row["id"], "stopped", payload)
+                else:
+                    payload["error"] = "worker_restarted"
+                    payload["progress"].update(
+                        step="failed", message="Validation was interrupted by a worker restart"
+                    )
+                    store.update_validation(row["id"], "failed", payload)
         validator = HistoricalValidator(store, PaperBroker(), ResearchClient())
         while True:
             try:

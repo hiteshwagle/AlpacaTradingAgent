@@ -156,6 +156,14 @@ def register(server, store=None, broker_factory=PaperBroker):
                 return jsonify(error=message), 409
             return jsonify(error="Invalid historical validation settings"), 400
 
+    @server.post("/api/portfolio/validations/<run_id>/stop")
+    def stop_validation(run_id):
+        try:
+            status = store.request_validation_stop(run_id)
+            return jsonify(validation_id=run_id, status=status), 202
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 409
+
     @server.post("/api/portfolio/halt")
     def halt():
         value = (request.get_json() or {}).get("halted")

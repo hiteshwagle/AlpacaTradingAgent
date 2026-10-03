@@ -160,8 +160,50 @@ class Store:
 
     def update_validation(self, run_id, status, payload):
         with self.db() as db:
+            current = db.execute(
+                "SELECT payload FROM validation_runs WHERE id=?", (run_id,)
+            ).fetchone()
+            if current and json.loads(current["payload"]).get("stop_requested"):
+                # The worker holds an older in-memory payload while research is
+                # running. Never let a progress write erase a concurrent stop.
+                payload["stop_requested"] = True
             db.execute("UPDATE validation_runs SET status=?,updated_at=?,payload=? WHERE id=?",
                        (status, utcnow().isoformat(), encode(payload), run_id))
+
+    def request_validation_stop(self, run_id):
+        """Persist a cooperative stop request without discarding completed rows."""
+        with self.db() as db:
+            row = db.execute(
+                "SELECT status,payload FROM validation_runs WHERE id=?", (run_id,)
+            ).fetchone()
+            if not row:
+                raise ValueError("Historical validation was not found")
+            if row["status"] not in {"queued", "running"}:
+                raise ValueError("Historical validation is not running")
+            payload = json.loads(row["payload"])
+            payload["stop_requested"] = True
+            if row["status"] == "queued":
+                status = "stopped"
+                payload["progress"].update(
+                    step="stopped", message="Validation stopped before it started"
+                )
+            else:
+                status = "running"
+                payload["progress"].update(
+                    step="stopping", message="Stopping the current analysis safely"
+                )
+            db.execute(
+                "UPDATE validation_runs SET status=?,updated_at=?,payload=? WHERE id=?",
+                (status, utcnow().isoformat(), encode(payload), run_id),
+            )
+        return status
+
+    def validation_stop_requested(self, run_id):
+        with self.db() as db:
+            row = db.execute(
+                "SELECT payload FROM validation_runs WHERE id=?", (run_id,)
+            ).fetchone()
+        return bool(row and json.loads(row["payload"]).get("stop_requested"))
 
     def validations(self, limit=20):
         with self.db() as db:
