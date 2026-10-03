@@ -78,6 +78,12 @@ pilot makes 60 TradingAgents analyses. X is disabled by default for historical
 integrity; optional modes allow exact cached responses or recent search only when
 the requested date remains eligible.
 
+Outcome scoring uses a 1% neutral band. Buy matches above +1% and Sell matches
+below -1%; moves inside the band are inconclusive and do not reduce the decisive
+match rate. Hold is shown as Keep and represents retaining an existing long
+position: it matches when the return is at least -1% and fails only on a larger
+loss. Keep returns contribute the position's realized return rather than zero.
+
 When running without Docker, start the validation worker in a second terminal:
 
 ```bash

@@ -8,6 +8,7 @@ from flask import Response, jsonify, redirect, render_template, request
 from .clients import PaperBroker, ResearchClient, ScreenerClient
 from .models import HistoricalValidationRequest, Policy
 from .store import Store
+from .validation import apply_outcome_matrix
 
 
 def enabled():
@@ -137,7 +138,10 @@ def register(server, store=None, broker_factory=PaperBroker):
     @server.get("/api/portfolio/validations/latest")
     def latest_validation():
         rows = store.validations(1)
-        return jsonify(validation=rows[0] if rows else None,
+        latest = rows[0] if rows else None
+        if latest:
+            latest["payload"] = apply_outcome_matrix(latest["payload"])
+        return jsonify(validation=latest,
                        worker_heartbeat=store.get("validation_heartbeat"),
                        worker_error=store.get("validation_worker_error"))
 

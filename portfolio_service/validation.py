@@ -5,6 +5,25 @@ from statistics import mean
 
 from .models import HistoricalValidationRequest
 
+NEUTRAL_RETURN_BAND = .01
+
+
+def outcome_verdict(action, asset_return):
+    """Classify realized movement using the portfolio validation matrix.
+
+    Buy and Sell need a move beyond the neutral band in their expected
+    direction. Keep represents retaining an existing long position, so growth
+    and immaterial losses match; only a loss beyond the band does not.
+    """
+    normalized = str(action or "").upper()
+    if normalized == "HOLD":
+        return "matched" if asset_return >= -NEUTRAL_RETURN_BAND else "did_not_match"
+    if abs(asset_return) <= NEUTRAL_RETURN_BAND:
+        return "inconclusive"
+    expected_up = normalized == "BUY"
+    moved_up = asset_return > 0
+    return "matched" if moved_up == expected_up else "did_not_match"
+
 
 def score_decision(action, bars, benchmark_bars, horizons):
     """Score one saved decision using next-session-open execution."""
@@ -26,14 +45,17 @@ def score_decision(action, bars, benchmark_bars, horizons):
         benchmark_exit = benchmark_by_date.get(bars[horizon]["date"])
         if benchmark_entry and benchmark_exit:
             benchmark_return = benchmark_exit / benchmark_entry - 1
-        decision_return = asset_return if normalized == "BUY" else -asset_return if normalized == "SELL" else 0.0
-        correct = asset_return > 0 if normalized == "BUY" else asset_return < 0 if normalized == "SELL" else abs(asset_return) < .02
+        decision_return = -asset_return if normalized == "SELL" else asset_return
+        verdict = outcome_verdict(normalized, asset_return)
         outcomes.append({
             "horizon": horizon, "available": True, "exit_date": bars[horizon]["date"],
             "asset_return": asset_return, "decision_return": decision_return,
             "benchmark_return": benchmark_return,
             "alpha": asset_return - benchmark_return if benchmark_return is not None else None,
-            "correct": correct,
+            "verdict": verdict,
+            # Retain the field for older API/UI consumers. None means that the
+            # movement was too small to grade, not an incorrect recommendation.
+            "correct": None if verdict == "inconclusive" else verdict == "matched",
         })
     return {"entry_date": bars[0]["date"], "entry_price": entry, "outcomes": outcomes}
 
@@ -41,18 +63,44 @@ def score_decision(action, bars, benchmark_bars, horizons):
 def summarize(results):
     available = [outcome for row in results for outcome in row.get("score", {}).get("outcomes", [])
                  if outcome.get("available")]
+    decisive = [row for row in available if row.get("verdict") != "inconclusive"]
     decisions = [row for row in results if row.get("status") == "completed"]
     return {
         "decisions_completed": len(decisions),
         "decisions_failed": len(results) - len(decisions),
         "outcomes_scored": len(available),
+        "outcomes_decisive": len(decisive),
+        "outcomes_inconclusive": len(available) - len(decisive),
         "directional_accuracy": (
-            sum(bool(row["correct"]) for row in available) / len(available) if available else None
+            sum(bool(row["correct"]) for row in decisive) / len(decisive) if decisive else None
         ),
         "mean_decision_return": mean(row["decision_return"] for row in available) if available else None,
         "mean_asset_alpha": mean(row["alpha"] for row in available if row.get("alpha") is not None)
         if any(row.get("alpha") is not None for row in available) else None,
     }
+
+
+def apply_outcome_matrix(payload):
+    """Apply the current matrix to new or previously stored validation rows.
+
+    Historical runs persist raw returns, so their verdicts can be safely
+    recalculated when the matrix changes without rerunning expensive research.
+    """
+    results = payload.get("results", [])
+    for row in results:
+        action = str(row.get("recommendation", {}).get("action") or "").upper()
+        if action not in {"BUY", "HOLD", "SELL"}:
+            continue
+        for outcome in row.get("score", {}).get("outcomes", []):
+            if not outcome.get("available") or "asset_return" not in outcome:
+                continue
+            asset_return = float(outcome["asset_return"])
+            verdict = outcome_verdict(action, asset_return)
+            outcome["verdict"] = verdict
+            outcome["correct"] = None if verdict == "inconclusive" else verdict == "matched"
+            outcome["decision_return"] = -asset_return if action == "SELL" else asset_return
+    payload["summary"] = summarize(results)
+    return payload
 
 
 class HistoricalValidator:

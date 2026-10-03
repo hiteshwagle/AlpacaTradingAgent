@@ -6,11 +6,27 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 
-from portfolio_service.clients import PaperBroker, ResearchClient, RemoteError, ScreenerClient
+from portfolio_service.clients import (
+    PaperBroker,
+    RemoteError,
+    ResearchClient,
+    ScreenerClient,
+)
 from portfolio_service.engine import Engine
-from portfolio_service.models import HistoricalValidationRequest, Policy, allocate, next_run
+from portfolio_service.models import (
+    HistoricalValidationRequest,
+    Policy,
+    allocate,
+    next_run,
+)
 from portfolio_service.store import Store
-from portfolio_service.validation import HistoricalValidator, score_decision
+from portfolio_service.validation import (
+    HistoricalValidator,
+    apply_outcome_matrix,
+    outcome_verdict,
+    score_decision,
+    summarize,
+)
 from portfolio_service.web import register
 from portfolio_service.worker import tick
 
@@ -205,6 +221,22 @@ class StoreTests(unittest.TestCase):
 
 
 class HistoricalValidationTests(unittest.TestCase):
+    def test_portfolio_outcome_matrix(self):
+        cases = [
+            ("Buy", .02, "matched"),
+            ("Buy", -.02, "did_not_match"),
+            ("Buy", .005, "inconclusive"),
+            ("Sell", -.02, "matched"),
+            ("Sell", .02, "did_not_match"),
+            ("Sell", .0003, "inconclusive"),
+            ("Hold", .0436, "matched"),
+            ("Hold", -.005, "matched"),
+            ("Hold", -.0211, "did_not_match"),
+        ]
+        for action, movement, expected in cases:
+            with self.subTest(action=action, movement=movement):
+                self.assertEqual(outcome_verdict(action, movement), expected)
+
     def test_next_open_scoring_and_missing_horizon(self):
         bars = [{"date": f"2025-09-{day:02d}", "open": price}
                 for day, price in [(5, 100), (8, 105), (9, 110)]]
@@ -212,6 +244,53 @@ class HistoricalValidationTests(unittest.TestCase):
         self.assertAlmostEqual(scored["outcomes"][0]["asset_return"], .05)
         self.assertTrue(scored["outcomes"][0]["correct"])
         self.assertFalse(scored["outcomes"][1]["available"])
+
+    def test_inconclusive_outcome_is_excluded_from_match_rate(self):
+        rows = [
+            {"status": "completed", "score": {"outcomes": [
+                {"available": True, "verdict": "inconclusive", "correct": None,
+                 "decision_return": .005, "alpha": .001},
+                {"available": True, "verdict": "matched", "correct": True,
+                 "decision_return": .02, "alpha": .01},
+            ]}},
+        ]
+
+        summary = summarize(rows)
+
+        self.assertEqual(summary["outcomes_scored"], 2)
+        self.assertEqual(summary["outcomes_decisive"], 1)
+        self.assertEqual(summary["outcomes_inconclusive"], 1)
+        self.assertEqual(summary["directional_accuracy"], 1)
+
+    def test_keep_uses_the_retained_positions_return(self):
+        bars = [{"date": "2025-09-05", "open": 100},
+                {"date": "2025-09-08", "open": 104.36}]
+
+        outcome = score_decision("Hold", bars, bars, [1])["outcomes"][0]
+
+        self.assertEqual(outcome["verdict"], "matched")
+        self.assertTrue(outcome["correct"])
+        self.assertAlmostEqual(outcome["decision_return"], .0436)
+
+    def test_current_matrix_recalculates_stored_results_without_rerunning_research(self):
+        payload = {"results": [
+            {"status": "completed", "recommendation": {"action": "Hold"},
+             "score": {"outcomes": [{"horizon": 5, "available": True,
+                                       "asset_return": .0436, "correct": False,
+                                       "decision_return": 0, "alpha": .01}]}},
+            {"status": "completed", "recommendation": {"action": "Sell"},
+             "score": {"outcomes": [{"horizon": 5, "available": True,
+                                       "asset_return": .0003, "correct": False,
+                                       "decision_return": -.0003, "alpha": 0}]}},
+        ], "summary": {"directional_accuracy": 0}}
+
+        updated = apply_outcome_matrix(payload)
+
+        outcomes = [row["score"]["outcomes"][0] for row in updated["results"]]
+        self.assertEqual(outcomes[0]["verdict"], "matched")
+        self.assertEqual(outcomes[1]["verdict"], "inconclusive")
+        self.assertEqual(updated["summary"]["directional_accuracy"], 1)
+        self.assertEqual(updated["summary"]["outcomes_inconclusive"], 1)
 
     def test_validator_reports_progress_and_continues_failed_cells(self):
         with tempfile.TemporaryDirectory() as directory:
