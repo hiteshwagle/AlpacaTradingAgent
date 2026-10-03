@@ -52,11 +52,17 @@ def create_intervals():
 def create_stores():
     """Create store components for state management"""
     from webui.utils.storage import create_storage_store_component, create_api_keys_store_component
+    from portfolio_service.web import enabled
+    api_store = (
+        dcc.Store(id='api-keys-store', storage_type='memory', data={})
+        if enabled()
+        else create_api_keys_store_component()
+    )
     return [
         dcc.Store(id='app-store'),
         dcc.Store(id='chart-store', data={'last_symbol': None, 'selected_period': '1y'}),
         create_storage_store_component(),
-        create_api_keys_store_component()
+        api_store
     ]
 
 
@@ -99,7 +105,8 @@ def create_main_layout():
     )
     
     # Create API config modal
-    api_config_modal = create_api_config_modal()
+    from portfolio_service.web import enabled
+    api_config_modal = html.Div(id="api-config-disabled") if enabled() else create_api_config_modal()
     
     # Assemble the layout
     layout = dbc.Container(
@@ -167,6 +174,10 @@ def create_main_layout():
             
             # Main content
             header,
+            html.Details([
+                html.Summary("Integrated paper portfolio, discovery and schedules"),
+                html.Iframe(src="/portfolio", style={"width": "100%", "height": "1100px", "border": "0"}),
+            ], open=True),
             create_safety_panel(),
             alpaca_account_card,
             dbc.Row([

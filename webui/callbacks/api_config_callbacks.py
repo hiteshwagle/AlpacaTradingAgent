@@ -20,6 +20,10 @@ from webui.utils.storage import get_default_api_keys
 
 def register_api_config_callbacks(app):
     """Register API configuration callbacks"""
+    from portfolio_service.web import enabled
+    if enabled():
+        # Integrated mode keeps broker/provider credentials exclusively server-side.
+        return
     
     api_configs = get_api_configs()
     api_ids = [api["id"] for api in api_configs]

@@ -5,6 +5,8 @@ __pycache__
 **/*.pyc
 .venv
 venv
+env
+.tradingagents
 .env
 *.env
 node_modules
@@ -26,4 +28,3 @@ tradingagents/dataflows/data_cache/
 webui/__pycache__
 cli/__pycache__
 assets/
-

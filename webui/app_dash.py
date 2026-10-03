@@ -79,6 +79,9 @@ def create_app():
     
     # Initialize Flask server
     server = Flask(__name__)
+    from portfolio_service.web import enabled, register
+    integrated = enabled()
+    register(server)
 
     # Initialize Dash app with Bootstrap
     app = dash.Dash(
@@ -90,6 +93,7 @@ def create_app():
         ],
         suppress_callback_exceptions=APP_CONFIG["suppress_callback_exceptions"],
         update_title=APP_CONFIG["update_title"],
+        url_base_pathname="/research/" if integrated else "/",
     )
 
     # Set app title
@@ -102,6 +106,11 @@ def create_app():
     register_all_callbacks(app)
 
     return app
+
+
+def create_server():
+    """Return the Flask WSGI server for production process managers."""
+    return create_app().server
 
 
 def run_app(port=7860, share=False, server_name="127.0.0.1", debug=False, max_threads=1):
@@ -148,4 +157,4 @@ def __getattr__(name):
 
 
 if __name__ == "__main__":
-    run_app(debug=True) 
+    run_app(debug=True)

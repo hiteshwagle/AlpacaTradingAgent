@@ -68,6 +68,21 @@ AlpacaTradingAgent introduces powerful new capabilities specifically designed fo
 - **Chat-Style Debates**: Visualize agent debates as conversation threads
 - **Position Management**: View current positions, recent orders, and liquidate positions directly from UI
 - **Model Configuration**: Choose provider, model, provider-specific parameters, output language, and checkpoint resume from the UI
+- **Historical Validation**: Run a persistent symbol/date grid, watch per-decision progress, and compare next-open recommendations with 1/5/10/20-session outcomes without placing trades
+
+The integrated simple dashboard exposes Historical Validation at `/portfolio`.
+Validation runs are stored in the same portfolio SQLite database but processed by
+the separate `portfolio_service.validation_worker`, preventing a long historical
+test from blocking paper-portfolio scheduling. The default 15-symbol/four-date
+pilot makes 60 TradingAgents analyses. X is disabled by default for historical
+integrity; optional modes allow exact cached responses or recent search only when
+the requested date remains eligible.
+
+When running without Docker, start the validation worker in a second terminal:
+
+```bash
+python -m portfolio_service.validation_worker
+```
 
 ## Complete Guide
 
@@ -255,6 +270,71 @@ docker compose up -d --build
 
 This starts a local web server at http://localhost:7860. To use a different
 host port, set `HOST_PORT`, for example `HOST_PORT=7861 docker compose up -d --build`.
+
+### Integrated paper portfolio manager
+
+With `PORTFOLIO_ENABLED=true`, the dashboard includes an integrated
+portfolio workspace at `/portfolio`. It can display stock-screener candidates,
+breadth, groups, RRG, themes, watchlists, validation, options analytics and digest
+data; add selected US symbols; and run all selected symbols plus every existing US-equity holding
+through the TradingAgents HTTP API before producing one portfolio allocation.
+
+In integrated mode, `/` opens the plain-language portfolio experience and the
+original detailed single-symbol dashboard moves to `/research/`. The primary UI
+has five small areas—Home, Portfolio, Opportunities, Activity and Settings—with
+account summaries, readable recommendations and paper-trade history. Raw cycle
+data and specialist controls stay collapsed under Advanced settings.
+While a market check is running, Home shows its current stage, percentage,
+company being analyzed, completed/total count and paper-trade progress. The
+status updates every two seconds without repeatedly refreshing Alpaca balances.
+When Alpaca reports the market closed, the primary action is disabled and the
+page explains regular US trading hours instead of showing a generic safety error.
+
+Automatic discovery is enabled by default. Each cycle first includes every current
+holding and manually selected symbol, then adds up to five stock-screener Candidates
+or Leaders scoring at least 70, followed by up to five Alpaca activity candidates
+scoring at least 60. The limits, thresholds, and source toggles are editable in the
+portfolio UI. Symbols are deduplicated, stock-screener has priority when capacity is
+limited, and non-tradable or incomplete activity rows are excluded. Freshness and
+regular-session checks fail closed. Every admitted symbol still receives a complete
+TradingAgents analysis; discovery scores never directly create an order. Cycle
+history retains each candidate's source, score, independent completeness, warnings and scanner metadata
+so an automatic selection can be audited later.
+
+The initial policy permits at most 80% invested and keeps at least 20% cash.
+Concentration, turnover, daily-loss, quote-age and spread limits are editable but
+bounded. SELL orders complete and broker positions are reconciled before BUY
+orders begin. The worker records research IDs, target allocations, order intents,
+broker responses, fills, account equity and evaluation history in SQLite. Learning
+may reduce exposure after drawdown; it cannot raise user limits or change prompts.
+
+Start the persistent scheduler/executor in a second process:
+
+```bash
+python -m portfolio_service.worker
+```
+
+The worker is hardwired to Alpaca's paper endpoint and refuses to start unless
+`ALPACA_USE_PAPER=true`. Only one worker may own a database. Automatic cycles run
+only while Alpaca's clock reports the US market open, include all current holdings,
+block on stale or conflicting research, and pause for review after an ambiguous or
+partial order outcome. The UI provides manual, daily and interval schedules plus
+an emergency stop. Credentials are kept server-side in integrated mode rather than
+saved to browser localStorage.
+
+Custom scans are sent with stock-screener's typed `universe_def` contract and are
+fixed to the US market. The options view is read-only and reports unavailable when
+stock-screener's optional options analytics feature has not been enabled/published.
+Research request, polling and overall-cycle timeout values use the bounded
+`TRADINGAGENTS_API_*_SECONDS` settings documented in `env.sample`.
+
+For the three-project Docker deployment, use the parent repository's
+`docker-compose.integration.yml` and deployment instructions. That deployment
+uses only the parent's `.env.integration`; this project's `.env` remains for
+standalone execution and is not loaded by the integrated Compose services.
+Local virtual environments and portfolio journals are excluded from image builds.
+Container health checks use the unauthenticated `/healthz` readiness endpoint.
+Production containers serve the underlying Flask WSGI application with Waitress.
 
 ### Prompt Customization
 

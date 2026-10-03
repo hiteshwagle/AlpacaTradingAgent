@@ -91,6 +91,9 @@ def _apply_api_result(current_state, result, selected_analysts):
 
 def execute_trade_after_analysis(ticker, allow_shorts, trade_amount):
     """Execute trade based on analysis results"""
+    from portfolio_service.web import enabled
+    if enabled():
+        return "Use the portfolio manager to execute a coordinated paper cycle."
     try:
         print(f"[TRADE] Starting trade execution for {ticker}")
 
